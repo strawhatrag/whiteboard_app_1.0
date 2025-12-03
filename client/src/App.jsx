@@ -1,119 +1,241 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useRef, useState, useCallback } from "react";
 import io from "socket.io-client";
-import * as Y from "yjs";
+import * as Y from "yjs"; // CRITICAL: Yjs import
+import { v4 as uuidv4 } from "uuid";
+import { RefreshCw, Zap, Trash2, GitCommit } from "lucide-react";
+// NOTE: Using a static URL to fix compilation issues with import.meta.env
+// For your Docker demo, this needs to point to the NGINX Load Balancer (http://localhost:8080)
+const SOCKET_URL = "http://localhost:3001";
 
-// Connect to Node 1 by default
-const socket = io("http://localhost:3001");
+const socket = io(SOCKET_URL);
 
-function App() {
+// --- YJS STATE INITIALIZATION ---
+// Yjs document acts as the shared state object
+const ydoc = new Y.Doc();
+// The array holding all drawing shapes (our single source of truth)
+const yLines = ydoc.getArray("lines");
+
+// This component is the front-end 'Agent'
+const App = () => {
   const canvasRef = useRef(null);
   const [isDrawing, setIsDrawing] = useState(false);
   const [status, setStatus] = useState("Connecting...");
+  const [nodeId, setNodeId] = useState("");
+  const [currentColor, setCurrentColor] = useState("#000000"); // Default to black
+  const [currentStroke, setCurrentStroke] = useState(3);
 
-  // Yjs State (CRDTs)
-  const ydoc = useRef(new Y.Doc());
-  const yLines = useRef(ydoc.current.getArray("lines"));
-
+  // --- Synchronization and Initial Setup ---
   useEffect(() => {
-    socket.on("connect", () =>
-      setStatus(`Connected to Cloud Node: ${socket.id}`)
-    );
+    // 1. Connection Status (For Task 4 Demo)
+    socket.on("connect", () => {
+      setStatus(`Connected`);
+      setNodeId(socket.id);
+    });
     socket.on("disconnect", () => setStatus("Disconnected"));
 
-    // Sync Logic
+    // 2. INITIAL STATE SYNC (Task 3: Coherent State on Join)
     socket.on("sync-initial", (update) => {
-      Y.applyUpdate(ydoc.current, new Uint8Array(update));
+      Y.applyUpdate(ydoc, new Uint8Array(update));
       drawCanvas();
     });
 
+    // 3. REAL-TIME UPDATE SYNC (Task 3: Consistency)
     socket.on("sync-update", (update) => {
-      Y.applyUpdate(ydoc.current, new Uint8Array(update));
+      Y.applyUpdate(ydoc, new Uint8Array(update));
       drawCanvas();
     });
 
-    yLines.current.observe(() => {
-      drawCanvas();
-    });
+    // 4. OBSERVE LOCAL CHANGES: If Yjs updates (either locally or remotely), redraw
+    yLines.observe(drawCanvas);
 
     return () => {
       socket.off("connect");
+      socket.off("disconnect");
       socket.off("sync-initial");
       socket.off("sync-update");
+      yLines.unobserve(drawCanvas);
     };
   }, []);
 
-  const startDrawing = (e) => {
-    setIsDrawing(true);
-    const { offsetX, offsetY } = e.nativeEvent;
-    const newLine = { points: [offsetX, offsetY], color: "#000" };
-    yLines.current.push([newLine]);
-    broadcastUpdate();
-  };
-
-  const draw = (e) => {
-    if (!isDrawing) return;
-    const { offsetX, offsetY } = e.nativeEvent;
-    const lastLineIndex = yLines.current.length - 1;
-    const currentLine = yLines.current.get(lastLineIndex);
-    const updatedPoints = [...currentLine.points, offsetX, offsetY];
-
-    ydoc.current.transact(() => {
-      yLines.current.delete(lastLineIndex);
-      yLines.current.push([{ ...currentLine, points: updatedPoints }]);
-    });
-
-    broadcastUpdate();
-  };
-
-  const endDrawing = () => {
-    setIsDrawing(false);
-    broadcastUpdate();
-  };
-
-  const broadcastUpdate = () => {
-    const update = Y.encodeStateAsUpdate(ydoc.current);
+  // Helper: Calculates and sends the difference (delta) to the server
+  const broadcastUpdate = useCallback(() => {
+    // Yjs automatically calculates the minimal update package
+    const update = Y.encodeStateAsUpdate(ydoc);
     socket.emit("sync-update", update);
-  };
+  }, []);
 
-  const drawCanvas = () => {
+  // Helper: Renders all lines from the yLines array onto the canvas
+  const drawCanvas = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
+
+    // Clear the whole canvas before redrawing everything
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-    yLines.current.forEach((line) => {
+    yLines.toArray().forEach((line) => {
       ctx.beginPath();
-      ctx.strokeStyle = line.color;
-      ctx.lineWidth = 3;
+      ctx.strokeStyle = line.color || "#000";
+      ctx.lineWidth = line.stroke || 3;
+
       const points = line.points;
       if (points.length > 0) {
+        // Start the path
         ctx.moveTo(points[0], points[1]);
+        // Iterate through all subsequent points
         for (let i = 2; i < points.length; i += 2) {
           ctx.lineTo(points[i], points[i + 1]);
         }
       }
       ctx.stroke();
     });
+  }, []);
+
+  // --- Event Handlers (Drawing) ---
+  const startDrawing = (e) => {
+    // Prevent default mouse actions (like text selection)
+    e.preventDefault();
+    e.stopPropagation();
+
+    setIsDrawing(true);
+    const { offsetX, offsetY } = e.nativeEvent;
+
+    // Start a new line object with unique ID (important for drawing)
+    const newLine = {
+      id: uuidv4(),
+      points: [offsetX, offsetY],
+      color: currentColor,
+      stroke: currentStroke,
+    };
+
+    // Push to Shared State (Yjs)
+    yLines.push([newLine]);
+    broadcastUpdate();
   };
 
+  const draw = (e) => {
+    if (!isDrawing) return;
+    const { offsetX, offsetY } = e.nativeEvent;
+
+    // Get the index of the line we are currently drawing (the last one added)
+    const lastLineIndex = yLines.length - 1;
+    const currentLine = yLines.get(lastLineIndex);
+
+    // Update the line's point array in a transaction to be atomic
+    ydoc.transact(() => {
+      // We delete and re-insert the item to trigger a full update event (simpler conflict handling)
+      yLines.delete(lastLineIndex);
+      const updatedPoints = [...currentLine.points, offsetX, offsetY];
+      yLines.insert(lastLineIndex, [{ ...currentLine, points: updatedPoints }]);
+    });
+
+    broadcastUpdate();
+  };
+
+  const endDrawing = () => {
+    if (!isDrawing) return;
+    setIsDrawing(false);
+    broadcastUpdate();
+  };
+
+  const handleClear = () => {
+    // Use a Yjs transaction to delete all elements atomically
+    ydoc.transact(() => {
+      yLines.delete(0, yLines.length);
+    });
+    broadcastUpdate();
+  };
+
+  // Set the canvas size and responsive attributes
+  const canvasWidth = 800;
+  const canvasHeight = 600;
+
   return (
-    <div style={{ textAlign: "center", fontFamily: "Arial" }}>
-      <h1>Cloud Whiteboard</h1>
-      <p>
-        Status: <strong>{status}</strong>
-      </p>
-      <canvas
-        ref={canvasRef}
-        width={800}
-        height={500}
-        style={{ border: "2px solid #333", cursor: "crosshair" }}
-        onMouseDown={startDrawing}
-        onMouseMove={draw}
-        onMouseUp={endDrawing}
-        onMouseLeave={endDrawing}
-      />
+    <div className="min-h-screen bg-gray-50 flex flex-col items-center p-4 font-inter">
+      <div className="w-full max-w-4xl bg-white shadow-xl rounded-xl p-6">
+        <header className="mb-6 text-center">
+          <h1 className="text-4xl font-bold text-gray-800 flex items-center justify-center">
+            <Zap className="mr-3 text-indigo-600 h-8 w-8" />
+            Distributed Cloud Whiteboard
+          </h1>
+          <p className="text-sm text-gray-500 mt-2">
+            Status:{" "}
+            <span
+              className={`font-semibold ${
+                status === "Connected" ? "text-green-600" : "text-red-600"
+              }`}
+            >
+              {status}
+            </span>
+            <span className="ml-4 text-xs">
+              Node ID: {nodeId.substring(0, 10)}...
+            </span>
+          </p>
+        </header>
+
+        {/* Toolbar for drawing controls */}
+        <div className="flex justify-center space-x-4 p-3 bg-gray-100 rounded-lg mb-4 shadow-inner">
+          <label className="flex items-center text-sm font-medium text-gray-700">
+            Color:
+            <input
+              type="color"
+              value={currentColor}
+              onChange={(e) => setCurrentColor(e.target.value)}
+              className="ml-2 h-8 w-8 rounded-md border-gray-300"
+            />
+          </label>
+          <label className="flex items-center text-sm font-medium text-gray-700">
+            Stroke:
+            <input
+              type="range"
+              min="1"
+              max="15"
+              value={currentStroke}
+              onChange={(e) => setCurrentStroke(parseInt(e.target.value))}
+              className="ml-2 w-24 appearance-none h-2 bg-gray-300 rounded-lg"
+            />
+            <span className="ml-2 text-base">{currentStroke}px</span>
+          </label>
+          <button
+            onClick={handleClear}
+            className="flex items-center px-4 py-2 bg-red-500 text-white font-semibold rounded-lg shadow-md hover:bg-red-600 transition duration-150"
+          >
+            <Trash2 className="h-4 w-4 mr-1" /> Clear All
+          </button>
+        </div>
+
+        {/* Canvas Element */}
+        <div className="flex justify-center border-4 border-indigo-600 rounded-lg overflow-hidden">
+          <canvas
+            ref={canvasRef}
+            width={canvasWidth}
+            height={canvasHeight}
+            className="bg-white touch-none"
+            onMouseDown={startDrawing}
+            onMouseMove={draw}
+            onMouseUp={endDrawing}
+            onMouseLeave={endDrawing}
+            onTouchStart={startDrawing}
+            onTouchMove={draw}
+            onTouchEnd={endDrawing}
+          />
+        </div>
+
+        <footer className="mt-6 text-center text-gray-500 text-sm">
+          <p>
+            <GitCommit className="inline h-4 w-4 mr-1" />
+            This application uses **Node.js Agents** and **Redis Pub/Sub** to
+            ensure real-time consistency (CRDTs) across multiple servers.
+          </p>
+          <p className="mt-1 flex items-center justify-center">
+            <RefreshCw className="inline h-3 w-3 mr-1 text-blue-500" />
+            **Pro Tip for Demo:** Open this page in two separate browsers (or
+            tabs) and draw simultaneously to prove distributed consistency!
+          </p>
+        </footer>
+      </div>
     </div>
   );
-}
+};
 
 export default App;

@@ -1,187 +1,108 @@
-<!DOCTYPE html>
-<html>
+<script src="/socket.io/socket.io.js"></script>
+<script>
+  const canvas = document.getElementById("board");
+  const ctx = canvas.getContext("2d");
+  const socket = io({
+    transports: ['websocket']
+  });
 
-<head>
-  <title>Distributed Whiteboard</title>
-  <style>
-    body {
-      margin: 0;
-      background: #f4f6f9;
-      font-family: "Segoe UI", Arial, sans-serif;
-      overflow: hidden;
-    }
+  const colorPicker = document.getElementById("colorPicker");
+  const clearMineBtn = document.getElementById("clearMineBtn");
+  const clearAllBtn = document.getElementById("clearAllBtn");
+  const userLabel = document.getElementById("userLabel");
 
-    canvas {
-      background-color: #ffffff;
-      background-image:
-        linear-gradient(#e5e7eb 1px, transparent 1px),
-        linear-gradient(90deg, #e5e7eb 1px, transparent 1px);
-      background-size: 40px 40px;
-      display: block;
-      cursor: crosshair;
-    }
+  function resizeCanvas() {
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+  }
+  resizeCanvas();
+  window.addEventListener("resize", resizeCanvas);
 
-    #toolbar {
-      position: fixed;
-      bottom: 20px;
-      left: 50%;
-      transform: translateX(-50%);
-      background: rgba(255, 255, 255, 0.9);
-      backdrop-filter: blur(12px);
-      padding: 12px 20px;
-      border-radius: 16px;
-      display: flex;
-      gap: 12px;
-      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.15);
-      z-index: 10;
-      align-items: center;
-    }
+  let drawing = false;
+  let color = colorPicker.value;
+  let myUserId = null;
 
-    #toolbar button {
-      background: #111827;
-      color: white;
-      border: none;
-      padding: 10px 14px;
-      border-radius: 10px;
-      font-size: 14px;
-      cursor: pointer;
-      transition: 0.2s;
-    }
+  // ===== SESSION USER ID (PER TAB) =====
+  myUserId = sessionStorage.getItem("whiteboardSessionUserId");
+  if (!myUserId) {
+    myUserId = Math.random().toString(36).substring(2, 7).toUpperCase();
+    sessionStorage.setItem("whiteboardSessionUserId", myUserId);
+  }
 
-    #toolbar button:hover {
-      background: #374151;
-    }
+  // --- REGISTRATION ---
+  socket.emit("register", { userId: myUserId });
 
-    #toolbar input[type="color"] {
-      width: 38px;
-      height: 38px;
-      border-radius: 50%;
-      border: none;
-      cursor: pointer;
-    }
+  // Server sends back confirmation
+  socket.on("user-info", (info) => {
+    myUserId = info.userId;
+    userLabel.textContent = `You: ${myUserId}`;
+  });
 
-    #userLabel {
-      font-size: 14px;
-      color: #111827;
-      font-weight: 500;
-    }
-  </style>
-</head>
+  // CRITICAL: Received entire history on connection from Redis
+  socket.on("init-board", (strokes) => {
+    console.log(`Board initialized with ${strokes.length} persisted strokes.`);
+    ctx.clearRect(0, 0, canvas.width, canvas.height); // Start clean
+    strokes.forEach((s) => drawPoint(s.x, s.y, s.color));
+  });
 
-<body>
+  colorPicker.addEventListener("change", (e) => {
+    color = e.target.value;
+  });
 
-  <div id="toolbar">
-    <span id="userLabel">You: ...</span>
-    <input type="color" id="colorPicker" value="#000000">
-    <button id="clearMineBtn">Clear Mine</button>
-    <button id="clearAllBtn">Clear All</button>
-  </div>
+  // ✅ CLEAR ONLY MY STROKES (Server handles filtering against persistent store)
+  clearMineBtn.addEventListener("click", () => {
+    socket.emit("clear-mine");
+  });
 
-  <canvas id="board"></canvas>
+  // ✅ CLEAR EVERYONE (Server deletes the persistent store)
+  clearAllBtn.addEventListener("click", () => {
+    socket.emit("clear-all");
+  });
 
-  <script src="/socket.io/socket.io.js"></script>
-  <script>
-    const canvas = document.getElementById("board");
-    const ctx = canvas.getContext("2d");
-    const socket = io({
-      // Ensure connection prioritizes the WebSocket protocol for stability
-      transports: ['websocket']
-    });
+  // --- DRAWING LISTENERS ---
+  canvas.addEventListener("mousedown", () => (drawing = true));
+  canvas.addEventListener("mouseup", () => (drawing = false));
+  canvas.addEventListener("mouseleave", () => (drawing = false));
+  canvas.addEventListener("mousemove", draw);
 
-    const colorPicker = document.getElementById("colorPicker");
-    const clearMineBtn = document.getElementById("clearMineBtn");
-    const clearAllBtn = document.getElementById("clearAllBtn");
-    const userLabel = document.getElementById("userLabel");
+  function draw(e) {
+    if (!drawing) return;
 
-    function resizeCanvas() {
-      canvas.width = window.innerWidth;
-      canvas.height = window.innerHeight;
-    }
-    resizeCanvas();
-    window.addEventListener("resize", resizeCanvas);
+    const x = e.clientX;
+    const y = e.clientY;
 
-    let drawing = false;
-    let color = colorPicker.value;
-    let myUserId = null;
-    let clearedUsers = new Set();
+    const data = { x, y, color }; // userId is added by the server
 
-    // ===== SESSION USER ID (PER TAB) =====
-    myUserId = sessionStorage.getItem("whiteboardSessionUserId");
-    if (!myUserId) {
-      myUserId = Math.random().toString(36).substring(2, 7).toUpperCase();
-      sessionStorage.setItem("whiteboardSessionUserId", myUserId);
-    }
+    // 1. Draw LOCALLY first for zero-latency feedback
+    drawPoint(x, y, color);
 
-    // --- REGISTRATION ---
-    socket.emit("register", { userId: myUserId });
+    // 2. Send draw data to the server for persistence and broadcast
+    socket.emit("draw", data);
+  }
 
-    // Server sends back confirmation
-    socket.on("user-info", (info) => {
-      myUserId = info.userId;
-      userLabel.textContent = `You: ${myUserId}`;
-    });
+  // --- SERVER EVENTS ---
 
-    colorPicker.addEventListener("change", (e) => {
-      color = e.target.value;
-    });
+  // Received draw events from OTHER users
+  socket.on("draw", (data) => {
+    drawPoint(data.x, data.y, data.color);
+  });
 
-    // ✅ CLEAR ONLY MY STROKES
-    clearMineBtn.addEventListener("click", () => {
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      socket.emit("clear-mine");
-    });
+  // Server tells all clients to clear the canvas
+  socket.on("clear-all", () => {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+  });
 
-    // ✅ CLEAR EVERYONE
-    clearAllBtn.addEventListener("click", () => {
-      socket.emit("clear-all");
-    });
+  // CRITICAL: Server tells everyone to clear and redraw the filtered state
+  socket.on("reset-board", (strokes) => {
+    console.log(`Board reset, ${strokes.length} strokes redrawn from persistent store.`);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    strokes.forEach((s) => drawPoint(s.x, s.y, s.color));
+  });
 
-    // --- DRAWING LISTENERS ---
-    canvas.addEventListener("mousedown", () => (drawing = true));
-    canvas.addEventListener("mouseup", () => (drawing = false));
-    canvas.addEventListener("mouseleave", () => (drawing = false));
-    canvas.addEventListener("mousemove", draw);
-
-    function draw(e) {
-      if (!drawing) return;
-
-      const x = e.clientX;
-      const y = e.clientY;
-
-      // Include userId in the data payload
-      const data = { x, y, color, userId: myUserId };
-
-      // 1. Draw LOCALLY first for zero-latency feedback
-      drawPoint(x, y, color);
-
-      // 2. Send draw data to the server for broadcast to others
-      socket.emit("draw", data);
-    }
-
-    // Received draw events from OTHER users
-    socket.on("draw", (data) => {
-      drawPoint(data.x, data.y, data.color);
-    });
-
-    // Server tells all clients to clear the canvas
-    socket.on("clear-all", () => {
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-    });
-
-    // Event for when another user clears their board
-    socket.on("clear-user-broadcast", (data) => {
-      console.log(`User ${data.userId} cleared their strokes (requires state for proper cleanup).`);
-      // In a fully stateful system, this event would trigger a board resync.
-    });
-
-    function drawPoint(x, y, color) {
-      ctx.fillStyle = color;
-      ctx.beginPath();
-      ctx.arc(x, y, 4, 0, Math.PI * 2);
-      ctx.fill();
-    }
-  </script>
-
-</body>
-
-</html>
+  function drawPoint(x, y, color) {
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(x, y, 4, 0, Math.PI * 2);
+    ctx.fill();
+  }
+</script>
